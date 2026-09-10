@@ -8,8 +8,13 @@ on:
 permissions:
   contents: read
 
+env:
+  # Pinned in ONE place. A version named in two files is a version that can
+  # disagree with itself.
+  GOLANGCI_LINT_VERSION: v2.13.2
+
 jobs:
-  build:
+  gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,30 +41,38 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      # THE LINT RUNS THE COMMAND A DEVELOPER RUNS, not a marketplace action
+      # wrapping it. That is pigfox2's PF-S269 ruling applied here, and this
+      # repository earned it the hard way on its first push: the config is
+      # golangci-lint v2, golangci-lint-action@v6 refuses a v2 version string,
+      # and the job failed with "golangci-lint v2 is not supported by
+      # golangci-lint-action v6" — a failure about the wrapper, in a repository
+      # whose actual lint was clean.
+      #
+      # Bumping the action to v7 would have fixed that one error and left the
+      # real defect: two lint surfaces, the local `golangci-lint run ./...` and
+      # whatever the action decides to invoke, free to drift apart quietly.
+      # Installing a pinned binary and running the same command in both places
+      # means there is one surface and it cannot disagree with itself.
+      - name: install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${{ env.GOLANGCI_LINT_VERSION }}
+
+      - name: golangci-lint (BLOCKING)
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          golangci-lint version
+          golangci-lint run ./...
+
       - name: test (race, shuffled)
-        run: go test -race -shuffle=on ./...
+        run: go test -race -shuffle=on -count=1 ./...
 
       - name: coverage
         # THE THRESHOLD IS A GATE, NOT A REPORT. A coverage number printed and
-        # not enforced is a log line — the same failure shape this module's
-        # own docs describe for a vendor status code that is checked and then
-        # ignored.
+        # not enforced is a log line — the same failure shape this module's own
+        # docs describe for a vendor status code that is checked and ignored.
         run: |
           go test -covermode=atomic -coverprofile=cover.out ./...
           go tool cover -func=cover.out | tail -1
           pct=$(go tool cover -func=cover.out | tail -1 | grep -oE '[0-9]+\.[0-9]+')
           echo "total coverage: ${pct}%"
           awk -v p="$pct" 'BEGIN { if (p+0 < 100) { print "coverage " p "% is below the required 100%"; exit 1 } }'
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-          check-latest: true
-      - uses: golangci/golangci-lint-action@v6
-        with:
-          version: v2.13.2
-          args: --timeout=5m
