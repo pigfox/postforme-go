@@ -218,7 +218,8 @@ func TestListResults(t *testing.T) {
 	c := newTestClient(t, func(r *http.Request) (*http.Response, error) {
 		query = r.URL.RawQuery
 		return jsonResponse(200, `{"data":[
-			{"id":"r1","post_id":"sp_1","social_account_id":"spc_a","success":true,"error":{}},
+			{"id":"r1","post_id":"sp_1","social_account_id":"spc_a","success":true,"error":{},
+			 "platform_data":{"id":"urn:li:share:7100","url":"https://linkedin.test/feed/update/7100"}},
 			{"id":"r2","post_id":"sp_1","social_account_id":"spc_b","success":false,"error":{"message":"token expired"}},
 			{"id":"r3","post_id":"sp_1","social_account_id":"spc_c","success":false,"error":{"error":"rejected"}}
 		],"meta":{"total":3,"offset":0,"limit":50,"next":null}}`), nil
@@ -240,6 +241,14 @@ func TestListResults(t *testing.T) {
 	switch {
 	case !res[0].Success || res[0].Error != "":
 		t.Errorf("r1 = %+v, want success with no error text", res[0])
+	case res[0].PlatformPostID != "urn:li:share:7100":
+		t.Errorf("r1 PlatformPostID = %q", res[0].PlatformPostID)
+	case res[0].PlatformPostURL != "https://linkedin.test/feed/update/7100":
+		// The permalink is what a takedown flow shows an operator: a vendor
+		// delete removes the post from the vendor's queue, not from the network.
+		t.Errorf("r1 PlatformPostURL = %q", res[0].PlatformPostURL)
+	case res[1].PlatformPostURL != "":
+		t.Errorf("a failed result must carry no permalink, got %q", res[1].PlatformPostURL)
 	case res[1].Error != "token expired":
 		t.Errorf("r2 error = %q, want the message field", res[1].Error)
 	case res[2].Error != "rejected":

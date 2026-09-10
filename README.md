@@ -133,10 +133,7 @@ composition, and account IDs. Those belong to consumers, and three different
 consumers answer them three different ways.
 
 Also out for now, and additive when a consumer needs them: media upload,
-platform-specific configuration blocks, webhook management, and the
-`platform_data` field on a result (its shape was not observable at the time of
-writing, and inventing field names from an untyped spec property would be
-guessing at a contract).
+platform-specific configuration blocks, and webhook management.
 
 ## Licence
 

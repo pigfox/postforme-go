@@ -16,13 +16,15 @@ var listResultsOKCodes = []int{http.StatusOK}
 // individual network rejected it, so a consumer reconciling delivery reads
 // these rather than the post's status.
 //
-// IT IS AN ALLOWLIST, and one omission is deliberate rather than incidental.
-// The API's result carries a platform_data object that presumably holds the
-// per-network post id and permalink — the fields a takedown flow would want.
-// It is NOT decoded here, because no published post existed to observe its
-// shape while this package was written, and inventing field names from a
-// spec that declares the property as a bare object would be guessing at a
-// contract. It is additive the moment a real result can be read.
+// IT IS AN ALLOWLIST. platform_data is decoded because the spec DOES declare
+// its shape — {id, url} — which v0.1.0's comment claimed it did not. That claim
+// was read off a truncated dump of the schema rather than the schema, and the
+// correction is the reason this field exists: a consumer's takedown flow needs
+// the per-network permalink to tell an operator which posts remain live after
+// the vendor-side delete, and "we could not observe the shape" was not true.
+//
+// The two fields are still best-effort: they are absent until a network has
+// actually accepted the post, so they are empty on a pending or failed result.
 type Result struct {
 	// ID is the result's own identifier.
 	ID string `json:"id"`
@@ -39,6 +41,20 @@ type Result struct {
 	// "" for anything else. It is never the raw body: resultError is a
 	// two-field allowlist like every other decode here.
 	Error string
+	// PlatformPostID is the network's own id for the published post, from
+	// platform_data.id. Empty until the network accepts it.
+	PlatformPostID string
+	// PlatformPostURL is the live permalink, from platform_data.url. Empty
+	// until the network accepts it. A vendor-side delete does NOT remove the
+	// network post, so this is what a takedown flow shows an operator.
+	PlatformPostURL string
+}
+
+// platformData is the allowlist for platform_data. Two scalars, both declared
+// in the spec; anything else the vendor adds is discarded at the boundary.
+type platformData struct {
+	ID  string `json:"id"`
+	URL string `json:"url"`
 }
 
 // resultError is the narrow allowlist for a result's error object.
@@ -59,20 +75,23 @@ func (r resultError) text() string {
 // projected. Doing it this way keeps Error a plain string on the public type
 // instead of exposing the envelope.
 type resultWire struct {
-	ID        string      `json:"id"`
-	PostID    string      `json:"post_id"`
-	AccountID string      `json:"social_account_id"`
-	Success   bool        `json:"success"`
-	Error     resultError `json:"error"`
+	ID           string       `json:"id"`
+	PostID       string       `json:"post_id"`
+	AccountID    string       `json:"social_account_id"`
+	Success      bool         `json:"success"`
+	Error        resultError  `json:"error"`
+	PlatformData platformData `json:"platform_data"`
 }
 
 func (w resultWire) result() Result {
 	return Result{
-		ID:        w.ID,
-		PostID:    w.PostID,
-		AccountID: w.AccountID,
-		Success:   w.Success,
-		Error:     w.Error.text(),
+		ID:              w.ID,
+		PostID:          w.PostID,
+		AccountID:       w.AccountID,
+		Success:         w.Success,
+		Error:           w.Error.text(),
+		PlatformPostID:  w.PlatformData.ID,
+		PlatformPostURL: w.PlatformData.URL,
 	}
 }
 
