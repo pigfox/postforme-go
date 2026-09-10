@@ -1,0 +1,89 @@
+# Linter config for postforme-go.
+#
+# It mirrors pigfox2's set where the rules apply to a library. Four of that
+# repo's linters are dropped and each omission is a decision, not an oversight:
+# rowserrcheck and sqlclosecheck have no database here, testifylint has no
+# testify (the suite is stdlib-only), and forbidigo's rules there are about an
+# application's logger and root context, neither of which a library owns.
+version: "2"
+run:
+  timeout: 5m
+  tests: true
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - errorlint
+    - nilerr
+    - bodyclose
+    - noctx
+    - contextcheck
+    - copyloopvar
+    - durationcheck
+    - makezero
+    - unused
+    - ineffassign
+    - unparam
+    - forcetypeassert
+    - gosec
+    - mnd
+    - goconst
+    - misspell
+    - unconvert
+    - usestdlibvars
+    - perfsprint
+    - intrange
+    - predeclared
+    - gocritic
+    - gocyclo
+    - nestif
+    - exhaustive
+    - thelper
+    - tparallel
+  settings:
+    staticcheck:
+      checks: ["all"]
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+    misspell:
+      locale: US
+    mnd:
+      # HTTP status codes are named through net/http constants everywhere in
+      # this package; the remaining bare numbers are in test fixtures.
+      ignored-functions:
+        - "^time\\."
+    gocyclo:
+      min-complexity: 15
+    exhaustive:
+      check: [switch]
+      default-signifies-exhaustive: true
+    gocritic:
+      enabled-tags: [diagnostic, performance]
+      disabled-checks:
+        # Matched to pigfox2, and for a reason that is sharper in a library:
+        # hugeParam wants pointer receivers on the public request and response
+        # types. Handing callers *Post and *CreatePostInput would make every
+        # value shared and mutable, and a decoded response that a caller can
+        # mutate under another goroutine is a worse defect than copying 136
+        # bytes. Value semantics are the API contract here, not an oversight.
+        - hugeParam
+        - rangeValCopy
+  exclusions:
+    rules:
+      # Test fixtures carry literal status codes and byte counts on purpose:
+      # the point of a fixture is to state the value, not to name it.
+      - path: _test\.go
+        linters:
+          - mnd
+          - goconst
+          - gosec
+formatters:
+  enable:
+    - gofmt

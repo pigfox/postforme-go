@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          check-latest: true
+
+      - name: gofmt
+        # -l lists files needing formatting; any output fails the job. gofmt
+        # exits 0 even when it has findings, so the check is on the output.
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test (race, shuffled)
+        run: go test -race -shuffle=on ./...
+
+      - name: coverage
+        # THE THRESHOLD IS A GATE, NOT A REPORT. A coverage number printed and
+        # not enforced is a log line — the same failure shape this module's
+        # own docs describe for a vendor status code that is checked and then
+        # ignored.
+        run: |
+          go test -covermode=atomic -coverprofile=cover.out ./...
+          go tool cover -func=cover.out | tail -1
+          pct=$(go tool cover -func=cover.out | tail -1 | grep -oE '[0-9]+\.[0-9]+')
+          echo "total coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { if (p+0 < 100) { print "coverage " p "% is below the required 100%"; exit 1 } }'
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          check-latest: true
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.13.2
+          args: --timeout=5m
