@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -238,3 +239,63 @@ func (c *Client) DeletePost(ctx context.Context, id string) error {
 // endpoint, where a DELETE would mean something entirely different from what
 // the caller asked for.
 var ErrEmptyID = errors.New("postforme: an id is required")
+
+// listPostsOKCodes is the accepted success set for GET /social-posts.
+var listPostsOKCodes = []int{http.StatusOK}
+
+// PostFilter narrows a ListPosts call. A zero filter lists everything.
+type PostFilter struct {
+	// ExternalID matches the caller's own reference, exactly.
+	//
+	// IT IS THE ONLY WAY BACK TO A POST WHOSE ID YOU NEVER LEARNED. If a create
+	// answers 2xx and the response cannot be decoded, the post exists and its
+	// vendor id was in the body you could not read — see DecodeError. The
+	// external_id you sent is the one handle that survives, which is why this
+	// filter is the first thing ListPosts grew.
+	ExternalID string
+	// Status narrows to one of the Post* constants.
+	Status string
+	// Limit and Offset page the result. Limit <= 0 uses the API default.
+	Limit  int
+	Offset int
+}
+
+func (f PostFilter) query() url.Values {
+	q := url.Values{}
+	if f.ExternalID != "" {
+		q.Set("external_id", f.ExternalID)
+	}
+	if f.Status != "" {
+		q.Set("status", f.Status)
+	}
+	if f.Limit > 0 {
+		q.Set("limit", strconv.Itoa(f.Limit))
+	}
+	if f.Offset > 0 {
+		q.Set("offset", strconv.Itoa(f.Offset))
+	}
+	return q
+}
+
+// ListPosts returns one page of posts.
+//
+// AN EXTERNAL ID IS NOT UNIQUE AT THE VENDOR, and a caller recovering an orphan
+// must handle that rather than take the first row. Verified live: six posts came
+// back for one external_id, the residue of a create that was retried after a
+// decode failure. Two results mean something published twice, which is a finding
+// in its own right and not a lookup to resolve silently.
+func (c *Client) ListPosts(ctx context.Context, f PostFilter) ([]Post, Page, error) {
+	var env listEnvelope[Post]
+	err := c.do(ctx, request{
+		method:  http.MethodGet,
+		path:    "/social-posts",
+		query:   f.query(),
+		out:     &env,
+		op:      "listposts",
+		okCodes: listPostsOKCodes,
+	})
+	if err != nil {
+		return nil, Page{}, err
+	}
+	return env.Data, env.page(), nil
+}

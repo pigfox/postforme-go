@@ -1,9 +1,11 @@
 package postforme
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -308,4 +310,108 @@ func indexOf(h, n string) int {
 		}
 	}
 	return -1
+}
+
+// ── PF-S346: RECOVERING A POST WHOSE ID WE NEVER LEARNED ─────────────────────
+//
+// ListPosts exists for one job: a create answered 2xx, the body would not
+// decode, and the vendor id was in the bytes we could not read. external_id is
+// the only handle that survives.
+
+func TestListPostsByExternalID(t *testing.T) {
+	const body = `{"data":[{"id":"sp_1","external_id":"blog:x","caption":"c","status":"processed",
+		"social_accounts":[{"id":"spc_a","platform":"linkedin","username":"u",
+			"access_token":"SHOULD-NOT-BE-DECODED"}],
+		"created_at":"2026-09-11T01:00:00Z","updated_at":"2026-09-11T02:00:00Z"}],
+		"meta":{"total":1,"offset":0,"limit":50,"next":null}}`
+
+	c := newTestClient(t, func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/v1/social-posts" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("external_id"); got != "blog:x" {
+			t.Errorf("external_id = %q", got)
+		}
+		if got := r.URL.Query().Get("status"); got != PostProcessed {
+			t.Errorf("status = %q", got)
+		}
+		if got := r.URL.Query().Get("limit"); got != "10" {
+			t.Errorf("limit = %q", got)
+		}
+		if got := r.URL.Query().Get("offset"); got != "5" {
+			t.Errorf("offset = %q", got)
+		}
+		return jsonResponse(200, body), nil
+	})
+
+	posts, page, err := c.ListPosts(t.Context(), PostFilter{
+		ExternalID: "blog:x", Status: PostProcessed, Limit: 10, Offset: 5,
+	})
+	if err != nil {
+		t.Fatalf("ListPosts: %v", err)
+	}
+	if len(posts) != 1 || posts[0].ID != "sp_1" {
+		t.Fatalf("posts = %+v", posts)
+	}
+	if page.Total != 1 || page.HasMore {
+		t.Errorf("page = %+v", page)
+	}
+	// The same allowlist discipline as everywhere else: a list of posts embeds
+	// the same account objects a single post does, tokens included.
+	blob, err := json.Marshal(posts)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(blob), "SHOULD-NOT-BE-DECODED") ||
+		strings.Contains(string(blob), "access_token") {
+		t.Errorf("a listed post carries token material:\n%s", blob)
+	}
+}
+
+// TestListPostsZeroFilterSendsNoQuery pins that a zero filter lists everything
+// rather than sending empty parameters the API might read as a filter on "".
+func TestListPostsZeroFilterSendsNoQuery(t *testing.T) {
+	c := newTestClient(t, func(r *http.Request) (*http.Response, error) {
+		if got := r.URL.RawQuery; got != "" {
+			t.Errorf("a zero filter sent %q", got)
+		}
+		return jsonResponse(200, `{"data":[],"meta":{"total":0}}`), nil
+	})
+	if _, _, err := c.ListPosts(t.Context(), PostFilter{}); err != nil {
+		t.Fatalf("ListPosts: %v", err)
+	}
+}
+
+// TestListPostsReturnsEveryMatch is the property a caller must not assume away.
+//
+// An external_id is NOT unique at the vendor. Six posts really did come back for
+// one external_id in production, the residue of a create retried after a decode
+// failure. A caller that took posts[0] would adopt one of six and call the
+// incident resolved.
+func TestListPostsReturnsEveryMatch(t *testing.T) {
+	const body = `{"data":[
+		{"id":"sp_1","external_id":"blog:x","status":"processed"},
+		{"id":"sp_2","external_id":"blog:x","status":"processed"},
+		{"id":"sp_3","external_id":"blog:x","status":"processed"}],
+		"meta":{"total":3,"offset":0,"limit":50,"next":null}}`
+	c := newTestClient(t, staticJSON(200, body))
+
+	posts, page, err := c.ListPosts(t.Context(), PostFilter{ExternalID: "blog:x"})
+	if err != nil {
+		t.Fatalf("ListPosts: %v", err)
+	}
+	if len(posts) != 3 {
+		t.Fatalf("got %d posts, want all 3 — a duplicate publish must be visible to the caller",
+			len(posts))
+	}
+	if page.Total != 3 {
+		t.Errorf("page.Total = %d", page.Total)
+	}
+}
+
+func TestListPostsPropagatesAnError(t *testing.T) {
+	c := newTestClient(t, staticJSON(500, `{}`))
+	if _, _, err := c.ListPosts(t.Context(), PostFilter{ExternalID: "blog:x"}); err == nil {
+		t.Fatal("a 500 returned no error")
+	}
 }
