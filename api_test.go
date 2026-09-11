@@ -84,8 +84,21 @@ func TestGetPost(t *testing.T) {
 		if r.URL.Path != "/v1/social-posts/sp_abc" {
 			t.Errorf("path = %s", r.URL.Path)
 		}
+		// THE FIXTURE IS THE LIVE SHAPE, and it used to be `["spc_a"]`.
+		//
+		// That is how the []string defect shipped and stayed shipped: the type
+		// was written from the spec, the fixture was written from the type, and
+		// the two agreed with each other all the way to production while both
+		// disagreed with the API. A fixture copied from a declaration tests the
+		// declaration against itself. This one is trimmed from a real 201 body,
+		// tokens removed.
 		return jsonResponse(200, `{"id":"sp_abc","external_id":"blog:x","caption":"c",
-			"status":"processed","social_accounts":["spc_a"],
+			"status":"processed",
+			"social_accounts":[{"id":"spc_a","platform":"linkedin","username":"PigFox LLC",
+				"user_id":"1618339","external_id":null,
+				"access_token":"SHOULD-NOT-BE-DECODED","refresh_token":"SHOULD-NOT-BE-DECODED",
+				"access_token_expires_at":"2026-11-08T15:39:31.525+00:00",
+				"refresh_token_expires_at":"2027-09-10T15:40:31.525+00:00"}],
 			"created_at":"2026-09-10T01:00:00Z","updated_at":"2026-09-10T02:00:00Z"}`), nil
 	})
 	p, err := c.GetPost(t.Context(), "sp_abc")
@@ -99,8 +112,12 @@ func TestGetPost(t *testing.T) {
 		t.Errorf("ExternalID = %q", p.ExternalID)
 	case !p.Processed():
 		t.Error("Processed() should be true for status=processed")
-	case len(p.Accounts) != 1 || p.Accounts[0] != "spc_a":
+	case len(p.Accounts) != 1 || p.Accounts[0].ID != "spc_a":
 		t.Errorf("Accounts = %v", p.Accounts)
+	case p.Accounts[0].Platform != "linkedin" || p.Accounts[0].Username != "PigFox LLC":
+		t.Errorf("Accounts[0] = %+v", p.Accounts[0])
+	case len(p.AccountIDs()) != 1 || p.AccountIDs()[0] != "spc_a":
+		t.Errorf("AccountIDs() = %v", p.AccountIDs())
 	case !p.CreatedAt.Equal(time.Date(2026, 9, 10, 1, 0, 0, 0, time.UTC)):
 		t.Errorf("CreatedAt = %v", p.CreatedAt)
 	}

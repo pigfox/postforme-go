@@ -34,6 +34,61 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("postforme %s: http %d: %v", e.Op, e.StatusCode, e.Validation)
 }
 
+// DecodeError is a SUCCESS response whose body could not be decoded.
+//
+// # It is a distinct type because the right response to it is the opposite one
+//
+// Every other failure in this package means the operation did not happen. This
+// one means the API accepted the request — it answered 2xx — and only the
+// reading of its answer failed. For a GET that is a nuisance. For CreatePost it
+// is the difference between "publish it again" and "you have already published
+// it", and getting that backwards publishes the same post to every connected
+// network once per attempt.
+//
+// THAT IS NOT HYPOTHETICAL. v0.2.0 declared Post.Accounts as []string against a
+// live API that returns objects, so every create decoded-failed after a 201.
+// The error was a plain fmt.Errorf, Retryable saw something that was not an
+// *APIError and classified it as a transport failure, and one blog announcement
+// went out six times across four networks before the retry chain was stopped by
+// hand. Five of those could not be deleted: the vendor refuses to remove a
+// processed post.
+//
+// So this type exists, Retryable returns FALSE for it, Terminal returns TRUE for
+// it, and the message says in words that the operation may have succeeded.
+type DecodeError struct {
+	// Op is the client operation, e.g. "createpost".
+	Op string
+	// StatusCode is the SUCCESS status the API returned before the body failed
+	// to decode. It is always one of the operation's accepted codes.
+	StatusCode int
+	// Err is the underlying decode failure.
+	//
+	// THE BODY IS NOT HERE AND MUST NOT BE ADDED. The bytes that failed to
+	// parse are exactly the bytes that may carry a credential — the create
+	// response embeds OAuth tokens for every targeted account — so the one
+	// thing this type will not tell you is what it could not read.
+	Err error
+}
+
+func (e *DecodeError) Error() string {
+	return fmt.Sprintf("postforme %s: http %d succeeded but the response could not be decoded, "+
+		"so THE OPERATION MAY HAVE BEEN PERFORMED — do not retry it blindly: %v",
+		e.Op, e.StatusCode, e.Err)
+}
+
+// Unwrap exposes the underlying decode failure.
+func (e *DecodeError) Unwrap() error { return e.Err }
+
+// Undecoded reports whether err is a 2xx whose body could not be read.
+//
+// It is the predicate a caller needs before deciding to retry a non-idempotent
+// operation, and it is spelled out rather than left to errors.As at every call
+// site for the same reason NotFound is.
+func Undecoded(err error) bool {
+	var de *DecodeError
+	return errors.As(err, &de)
+}
+
 // Status returns the HTTP status code, or 0 if err is not an *APIError. It
 // saves every caller writing the same errors.As dance.
 func Status(err error) int {
@@ -61,6 +116,14 @@ func NotFound(err error) bool {
 // so a consumer that treats !Terminal as "retry" will retry a canceled context
 // forever. Ask the question you mean.
 func Terminal(err error) bool {
+	// A 2xx THAT COULD NOT BE DECODED IS TERMINAL, and it is the one terminal
+	// condition that is not a 4xx. The request succeeded; repeating it would
+	// perform the operation a second time. Callers ask Terminal precisely to
+	// decide whether to stop, so answering "not terminal" here is what turned a
+	// decode bug into six published copies of one post.
+	if Undecoded(err) {
+		return true
+	}
 	code := Status(err)
 	if code < 400 || code > 499 {
 		return false
@@ -76,6 +139,13 @@ func Retryable(err error) bool {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// A DECODED-FAILED SUCCESS IS NEVER RETRYABLE, and this check must come
+	// BEFORE the not-an-APIError fallthrough below — which is exactly where it
+	// used to land, and why it was retried. The operation may already have been
+	// performed; a retry is a second one.
+	if Undecoded(err) {
 		return false
 	}
 	var apiErr *APIError

@@ -110,11 +110,62 @@ type Post struct {
 	Caption string `json:"caption"`
 	// Status is one of the Post* constants.
 	Status string `json:"status"`
-	// Accounts are the social-account IDs this post targets.
-	Accounts []string `json:"social_accounts"`
+	// Accounts are the social accounts this post targets, as the API reports
+	// them back. See PostAccount for why this is not []string and not []Account.
+	Accounts []PostAccount `json:"social_accounts"`
 	// CreatedAt and UpdatedAt are the vendor's timestamps.
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// PostAccount is one account a post targets, as the API reports it INSIDE a
+// post body.
+//
+// # It is an allowlist, and the omissions are the entire reason it exists
+//
+// The live create response embeds the FULL account record for every targeted
+// account, including access_token, refresh_token, access_token_expires_at and
+// refresh_token_expires_at — real OAuth material, verified present in a 201
+// body. None of them is declared here, so encoding/json drops them at the
+// boundary: they are never materialized rather than redacted afterwards, which
+// is the same discipline Account applies to the list endpoint.
+//
+// # Why this is not Account
+//
+// The two shapes differ and neither is a superset. The account nested in a post
+// carries user_id and NO status; the one from ListAccounts carries status and no
+// user_id. Reusing Account would have declared a Status field that is always
+// empty here — a zero value that reads as AccountDisconnected and would make
+// Connected() report false for every account of every post.
+//
+// # Why this is not []string, which is what shipped
+//
+// v0.2.0 declared Accounts as []string against a spec that says social_accounts
+// is an array of ids. The live API returns objects. Every CreatePost therefore
+// got a 201 — the post was created and published — and then failed to decode it,
+// which callers saw as an error and retried, publishing the same post again on
+// every attempt. See DecodeError, which exists so that can never be retried
+// silently again.
+type PostAccount struct {
+	// ID is the account identifier, the same value CreatePostInput.Accounts takes.
+	ID string `json:"id"`
+	// Platform is the network, e.g. "linkedin", "facebook", "bluesky".
+	Platform string `json:"platform"`
+	// Username is the human-readable handle or page name.
+	Username string `json:"username"`
+}
+
+// AccountIDs projects the targeted account ids.
+//
+// It exists because that projection was what []string used to provide, and a
+// caller who only wanted the ids should not have to write a loop to get back
+// what a breaking change took away.
+func (p Post) AccountIDs() []string {
+	out := make([]string, 0, len(p.Accounts))
+	for _, a := range p.Accounts {
+		out = append(out, a.ID)
+	}
+	return out
 }
 
 // Processed reports whether the vendor has finished handling this post.

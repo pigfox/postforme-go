@@ -257,10 +257,18 @@ func (c *Client) attempt(ctx context.Context, endpoint string, payload []byte, r
 		return nil
 	}
 	if err := json.Unmarshal(raw, r.out); err != nil {
-		// The body is deliberately NOT included. A decode failure names the
-		// operation and the status; the bytes that failed to parse are exactly
-		// the thing that may carry a credential.
-		return fmt.Errorf("postforme %s: decode response (http %d): %w", r.op, resp.StatusCode, err)
+		// TYPED, NOT fmt.Errorf, AND THAT IS THE WHOLE POINT. The status is a
+		// success: the API performed the operation and only the reading of its
+		// answer failed. A plain error here is indistinguishable from a dial
+		// failure, so Retryable classified it as transport, do() retried it
+		// three times, the caller's queue retried that, and one post was
+		// published six times. *DecodeError is refused by Retryable and
+		// accepted by Terminal.
+		//
+		// The body is deliberately NOT carried. The bytes that failed to parse
+		// are exactly the thing that may hold a credential — a create response
+		// embeds OAuth tokens for every targeted account.
+		return &DecodeError{Op: r.op, StatusCode: resp.StatusCode, Err: err}
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package postforme
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -344,8 +345,18 @@ func TestDecodeFailureDoesNotLeakTheBody(t *testing.T) {
 	if strings.Contains(err.Error(), secret) {
 		t.Fatalf("the response body reached the error string: %v", err)
 	}
-	if !strings.Contains(err.Error(), "decode response") {
+	if !strings.Contains(err.Error(), "could not be decoded") {
 		t.Errorf("the error should say what failed, got %v", err)
+	}
+
+	// AND IT MUST SAY THE OPERATION MAY HAVE HAPPENED. That sentence is the
+	// whole difference between a caller retrying a publish and a caller
+	// stopping — see DecodeError.
+	if !strings.Contains(err.Error(), "MAY HAVE BEEN PERFORMED") {
+		t.Errorf("the error does not warn that the operation may have succeeded: %v", err)
+	}
+	if !Undecoded(err) {
+		t.Errorf("Undecoded does not recognize its own error: %v", err)
 	}
 }
 
@@ -387,3 +398,196 @@ func TestReadFailureIsReported(t *testing.T) {
 type errReader struct{}
 
 func (errReader) Read([]byte) (int, error) { return 0, errors.New("boom") }
+
+// ── PF-S345: A 2xx THAT WILL NOT DECODE IS TERMINAL ──────────────────────────
+//
+// WHAT THESE GUARD, as the incident rather than the feature. v0.2.0 declared
+// Post.Accounts as []string against a live API that returns objects. Every
+// CreatePost got a 201 — the post was created and published to every targeted
+// network — and then failed to decode. The error was a plain fmt.Errorf, so
+// Retryable took the "not an *APIError, therefore transport" branch and do()
+// re-POSTed it twice more; the consuming queue retried that five times over. One
+// blog announcement went out six times across four networks before the chain was
+// stopped by hand, and five of those could not be removed: the vendor refuses to
+// delete a processed post.
+//
+// THE MULTIPLICATION IS THE THING TO REMEMBER. maxRetries defaults to 2, so one
+// logical publish is three round-trips here; a caller retrying five times makes
+// fifteen. Every one of them is a POST that creates a post.
+
+// TestCreatePostDecodesTheLiveAccountShape is the direct root-cause test.
+//
+// The body is trimmed from a real 201, tokens replaced. If Accounts goes back to
+// []string this fails to decode and the test says so.
+func TestCreatePostDecodesTheLiveAccountShape(t *testing.T) {
+	const body = `{"id":"sp_new","external_id":"blog:x","caption":"c","status":"draft",
+		"media":[],"platform_configurations":{},"account_configurations":[],
+		"social_accounts":[
+			{"id":"spc_li","platform":"linkedin","username":"PigFox LLC","user_id":"1618339",
+			 "external_id":null,
+			 "access_token":"SHOULD-NOT-BE-DECODED","refresh_token":"SHOULD-NOT-BE-DECODED",
+			 "access_token_expires_at":"2026-11-08T15:39:31.525+00:00",
+			 "refresh_token_expires_at":"2027-09-10T15:40:31.525+00:00"},
+			{"id":"spc_bs","platform":"bluesky","username":"pigfox.bsky.social","user_id":"did:plc:x",
+			 "external_id":null,"access_token":"SHOULD-NOT-BE-DECODED","refresh_token":"SHOULD-NOT-BE-DECODED"}],
+		"scheduled_at":"2026-09-11T20:59:11.263655+00:00",
+		"created_at":"2026-09-11T20:59:11.263655+00:00",
+		"updated_at":"2026-09-11T20:59:11.263655+00:00"}`
+
+	var calls int
+	c := newTestClient(t, func(*http.Request) (*http.Response, error) {
+		calls++
+		return jsonResponse(201, body), nil
+	})
+
+	p, err := c.CreatePost(t.Context(), CreatePostInput{Caption: "c", Accounts: []string{"spc_li", "spc_bs"}})
+	if err != nil {
+		t.Fatalf("a live-shaped 201 did not decode: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("made %d round-trips for one create, want 1", calls)
+	}
+	if p.ID != "sp_new" || p.Status != PostDraft {
+		t.Errorf("post = %+v", p)
+	}
+	if len(p.Accounts) != 2 {
+		t.Fatalf("decoded %d accounts, want 2", len(p.Accounts))
+	}
+	if p.Accounts[0].ID != "spc_li" || p.Accounts[0].Platform != "linkedin" ||
+		p.Accounts[0].Username != "PigFox LLC" {
+		t.Errorf("Accounts[0] = %+v", p.Accounts[0])
+	}
+	if got := p.AccountIDs(); len(got) != 2 || got[1] != "spc_bs" {
+		t.Errorf("AccountIDs() = %v", got)
+	}
+
+	// THE TOKENS MUST BE UNREACHABLE, and this is checked over the decoded value
+	// rather than trusted from the type declaration: a field added later with a
+	// token tag would compile and pass every other assertion here.
+	blob, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal decoded post: %v", err)
+	}
+	for _, banned := range []string{"SHOULD-NOT-BE-DECODED", "access_token", "refresh_token"} {
+		if strings.Contains(string(blob), banned) {
+			t.Errorf("the decoded post carries %q; the create response embeds real OAuth "+
+				"material and PostAccount must not be able to hold it:\n%s", banned, blob)
+		}
+	}
+}
+
+// TestUndecodableSuccessIsTerminalAndNotRetried is the retry half.
+//
+// ONE ROUND-TRIP. Not two, not three. The post exists after the first one.
+func TestUndecodableSuccessIsTerminalAndNotRetried(t *testing.T) {
+	// THE PRODUCTION RETRY BUDGET. With the helper's WithMaxRetries(0) this
+	// test would pass against the very bug it was written for.
+	var calls int
+	c := newTestClient(t, func(*http.Request) (*http.Response, error) {
+		calls++
+		return jsonResponse(201, `{"id":"sp_new","social_accounts":"not an array at all"}`), nil
+	}, WithMaxRetries(DefaultMaxRetries))
+
+	_, err := c.CreatePost(t.Context(), CreatePostInput{Caption: "c", Accounts: []string{"spc_a"}})
+	if err == nil {
+		t.Fatal("an undecodable body returned no error")
+	}
+	if calls != 1 {
+		t.Fatalf("made %d POSTs for one create; each one publishes. This is the defect: "+
+			"maxRetries is %d, so the old behavior made %d", calls, c.maxRetries, c.maxRetries+1)
+	}
+	if !Undecoded(err) {
+		t.Errorf("the error is not a *DecodeError: %v", err)
+	}
+	if Retryable(err) {
+		t.Error("a decoded-failed success is Retryable; a retry is a second publish")
+	}
+	if !Terminal(err) {
+		t.Error("a decoded-failed success is not Terminal; a caller asking whether to stop " +
+			"is told to continue")
+	}
+	if Status(err) != 0 {
+		t.Errorf("Status() = %d; a DecodeError is not an APIError", Status(err))
+	}
+}
+
+// TestNoCreatePathRunsMoreThanOncePerAttempt is the table the incident asks for.
+//
+// It drives EVERY outcome a create can have and pins the number of POSTs each
+// one costs. The rows that matter are the ones costing 1: a create is not
+// idempotent, so any outcome that repeats it publishes again.
+func TestNoCreatePathRunsMoreThanOncePerAttempt(t *testing.T) {
+	const liveBody = `{"id":"sp_x","status":"draft","social_accounts":[{"id":"spc_a","platform":"x","username":"u"}]}`
+
+	rows := []struct {
+		name      string
+		status    int
+		body      string
+		wantCalls int
+		why       string
+	}{
+		{"201 decodes", 201, liveBody, 1, "the ordinary success"},
+		{"200 decodes", 200, liveBody, 1, "the documented success code"},
+		{"201 will not decode", 201, `{"social_accounts":"nope"}`, 1,
+			"THE INCIDENT: the post exists; a retry publishes a second one"},
+		{"200 will not decode", 200, `{"social_accounts":"nope"}`, 1, "same, on the documented code"},
+		{"400 rejected", 400, `{"message":"Invalid Request"}`, 1,
+			"a terminal 4xx: repeating a wrong request is turning our bug into vendor load"},
+		{"404", 404, `{}`, 1, "terminal on sight"},
+		{"429 rate limited", 429, `{}`, 3, "transient: retrying is correct AND the create did not happen"},
+		{"500", 500, `{}`, 3, "server error: the create did not happen"},
+	}
+
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			// THE PRODUCTION RETRY BUDGET, not the helper's zero. This table is
+			// about how many POSTs an outcome COSTS, and a client with
+			// retrying switched off answers 1 for every row — including the
+			// rows that are wrong. DefaultMaxRetries is what shipped.
+			var calls int
+			c := newTestClient(t, func(*http.Request) (*http.Response, error) {
+				calls++
+				return jsonResponse(r.status, r.body), nil
+			}, WithMaxRetries(DefaultMaxRetries))
+			_, _ = c.CreatePost(t.Context(), CreatePostInput{Caption: "c", Accounts: []string{"spc_a"}})
+			if calls != r.wantCalls {
+				t.Errorf("%s: %d POSTs, want %d — %s", r.name, calls, r.wantCalls, r.why)
+			}
+		})
+	}
+
+	// The anchor: a retrying row really does retry, so the wantCalls==1 rows
+	// above are a property of the classification rather than of a client that
+	// stopped retrying altogether.
+	var calls int
+	c := newTestClient(t, func(*http.Request) (*http.Response, error) {
+		calls++
+		return jsonResponse(503, `{}`), nil
+	}, WithMaxRetries(DefaultMaxRetries))
+	_, _ = c.CreatePost(t.Context(), CreatePostInput{Caption: "c", Accounts: []string{"spc_a"}})
+	if calls < 2 {
+		t.Fatalf("a 503 made %d attempts; retrying is disabled entirely and every row above "+
+			"passes for the wrong reason", calls)
+	}
+}
+
+// TestClientValidationRefusalsCostNoRoundTrip pins the two client-side refusals,
+// which are the cheapest way a create can fail to happen at all.
+func TestClientValidationRefusalsCostNoRoundTrip(t *testing.T) {
+	for name, in := range map[string]CreatePostInput{
+		"no caption":  {Accounts: []string{"spc_a"}},
+		"no accounts": {Caption: "c"},
+	} {
+		var calls int
+		c := newTestClient(t, func(*http.Request) (*http.Response, error) {
+			calls++
+			return jsonResponse(201, `{}`), nil
+		})
+		if _, err := c.CreatePost(t.Context(), in); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+		if calls != 0 {
+			t.Errorf("%s: made %d round-trips for a request the client already knows is bad", name, calls)
+		}
+	}
+}

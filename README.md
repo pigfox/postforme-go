@@ -11,6 +11,35 @@ go get github.com/pigfox/postforme-go
 
 Requires Go 1.24+. **No third-party dependencies** — standard library only.
 
+## Retrying a create is not safe unless the client says so
+
+`CreatePost` is **not idempotent**: every call that reaches the API creates a
+post. So the only question that matters after a failure is whether the request
+arrived, and this package answers it with the error type rather than leaving it
+to a status-code guess.
+
+```go
+post, err := c.CreatePost(ctx, in)
+switch {
+case err == nil:
+	// published
+case postforme.Undecoded(err):
+	// THE API ACCEPTED IT. The post exists; only reading the answer failed.
+	// Do NOT retry — reconcile by external_id instead.
+case postforme.Terminal(err):
+	// the request was refused and repeating it will be refused again
+case postforme.Retryable(err):
+	// it did not arrive; try again
+}
+```
+
+`Undecoded` exists because getting this wrong is expensive and quiet. v0.2.0
+declared `Post.Accounts` as `[]string` while the live API returns objects, so
+every create got a 201 and then failed to decode. The error was untyped,
+`Retryable` classified it as a transport failure, and one post was published
+once per attempt — three times inside this client, multiplied by the caller's
+own retries. `Terminal` now reports true for it and `Retryable` reports false.
+
 ## Why this exists
 
 Post for Me ships an official, Stainless-generated Go library. Use it if it
