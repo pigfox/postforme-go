@@ -519,23 +519,33 @@ func TestUndecodableSuccessIsTerminalAndNotRetried(t *testing.T) {
 func TestNoCreatePathRunsMoreThanOncePerAttempt(t *testing.T) {
 	const liveBody = `{"id":"sp_x","status":"draft","social_accounts":[{"id":"spc_a","platform":"x","username":"u"}]}`
 
+	// wantErr IS ASSERTED, NOT DISCARDED (PF-S348). These rows used to throw the
+	// return away with `_, _ =`, which .golangci.yml refuses — errcheck runs with
+	// check-blank: true here, so a blank assignment is a finding by policy and
+	// this file put postforme-go's CI red on main for twenty hours.
+	//
+	// Handling it is also the better test. The POST COUNT alone cannot tell a
+	// success from a failure that happened to cost one round-trip, so a row that
+	// silently started erroring would still have passed. Now each row states
+	// both what the outcome COSTS and what it IS.
 	rows := []struct {
 		name      string
 		status    int
 		body      string
 		wantCalls int
+		wantErr   bool
 		why       string
 	}{
-		{"201 decodes", 201, liveBody, 1, "the ordinary success"},
-		{"200 decodes", 200, liveBody, 1, "the documented success code"},
-		{"201 will not decode", 201, `{"social_accounts":"nope"}`, 1,
+		{"201 decodes", 201, liveBody, 1, false, "the ordinary success"},
+		{"200 decodes", 200, liveBody, 1, false, "the documented success code"},
+		{"201 will not decode", 201, `{"social_accounts":"nope"}`, 1, true,
 			"THE INCIDENT: the post exists; a retry publishes a second one"},
-		{"200 will not decode", 200, `{"social_accounts":"nope"}`, 1, "same, on the documented code"},
-		{"400 rejected", 400, `{"message":"Invalid Request"}`, 1,
+		{"200 will not decode", 200, `{"social_accounts":"nope"}`, 1, true, "same, on the documented code"},
+		{"400 rejected", 400, `{"message":"Invalid Request"}`, 1, true,
 			"a terminal 4xx: repeating a wrong request is turning our bug into vendor load"},
-		{"404", 404, `{}`, 1, "terminal on sight"},
-		{"429 rate limited", 429, `{}`, 3, "transient: retrying is correct AND the create did not happen"},
-		{"500", 500, `{}`, 3, "server error: the create did not happen"},
+		{"404", 404, `{}`, 1, true, "terminal on sight"},
+		{"429 rate limited", 429, `{}`, 3, true, "transient: retrying is correct AND the create did not happen"},
+		{"500", 500, `{}`, 3, true, "server error: the create did not happen"},
 	}
 
 	for _, r := range rows {
@@ -549,9 +559,12 @@ func TestNoCreatePathRunsMoreThanOncePerAttempt(t *testing.T) {
 				calls++
 				return jsonResponse(r.status, r.body), nil
 			}, WithMaxRetries(DefaultMaxRetries))
-			_, _ = c.CreatePost(t.Context(), CreatePostInput{Caption: "c", Accounts: []string{"spc_a"}})
+			_, err := c.CreatePost(t.Context(), CreatePostInput{Caption: "c", Accounts: []string{"spc_a"}})
 			if calls != r.wantCalls {
 				t.Errorf("%s: %d POSTs, want %d — %s", r.name, calls, r.wantCalls, r.why)
+			}
+			if gotErr := err != nil; gotErr != r.wantErr {
+				t.Errorf("%s: error=%v, want %v (%v)", r.name, gotErr, r.wantErr, err)
 			}
 		})
 	}
@@ -564,7 +577,12 @@ func TestNoCreatePathRunsMoreThanOncePerAttempt(t *testing.T) {
 		calls++
 		return jsonResponse(503, `{}`), nil
 	}, WithMaxRetries(DefaultMaxRetries))
-	_, _ = c.CreatePost(t.Context(), CreatePostInput{Caption: "c", Accounts: []string{"spc_a"}})
+	// A 503 must still come back as an error after its retries are spent; a
+	// retrying client that eventually returned nil would satisfy the count below
+	// and be catastrophically wrong.
+	if _, err := c.CreatePost(t.Context(), CreatePostInput{Caption: "c", Accounts: []string{"spc_a"}}); err == nil {
+		t.Error("a 503 exhausted its retries and returned no error")
+	}
 	if calls < 2 {
 		t.Fatalf("a 503 made %d attempts; retrying is disabled entirely and every row above "+
 			"passes for the wrong reason", calls)
